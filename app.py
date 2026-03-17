@@ -11,7 +11,7 @@ st.markdown(
     "built for anyone new to fixed income."
 )
 
-tabs = st.tabs(["📈 Yield Curve", "⏱ Duration", "💵 Price Sensitivity"])
+tabs = st.tabs(["📈 Yield Curve", "⏱ Duration", "💵 Price Sensitivity", "🎯 Black-Litterman"])
 
 
 # ---------------------------------------------------------------------------
@@ -272,4 +272,355 @@ prices rise *more* when yields fall than they fall when yields rise by the same 
   duration-only estimate.
 - All else equal, **higher convexity is better** for the bondholder.
             """
+        )
+
+
+# ---------------------------------------------------------------------------
+# TAB 4 — BLACK-LITTERMAN
+# ---------------------------------------------------------------------------
+
+def bl_posterior(w_mkt, sigma, delta, views_returns, confidences, tau=0.05):
+    """
+    Simplified Black-Litterman posterior mean returns.
+    Assumes one absolute view per asset (P = I).
+    Returns equilibrium returns (pi) and BL posterior returns (mu_bl).
+    """
+    n = len(w_mkt)
+    # Step 1: reverse-optimise to get market-implied equilibrium returns
+    pi = delta * sigma @ w_mkt
+
+    # Step 2: build uncertainty matrix Omega — low confidence = high uncertainty
+    # Confidence is 0-1; map to uncertainty: 0% confidence => huge omega, 100% => tiny
+    epsilon = 1e-6
+    omega = np.diag([(1.0 - c + epsilon) * tau * sigma[i, i]
+                     for i, c in enumerate(confidences)])
+
+    # Step 3: P = identity (one absolute view per asset), Q = view returns
+    P = np.eye(n)
+    Q = np.array(views_returns)
+
+    # Step 4: posterior mean (He & Litterman formula)
+    tau_sigma = tau * sigma
+    M = np.linalg.inv(tau_sigma) + P.T @ np.linalg.inv(omega) @ P
+    mu_bl = np.linalg.inv(M) @ (np.linalg.inv(tau_sigma) @ pi + P.T @ np.linalg.inv(omega) @ Q)
+
+    return pi, mu_bl
+
+
+def bl_weights(mu, sigma, delta):
+    """Unconstrained mean-variance optimal weights given expected returns."""
+    w = np.linalg.inv(delta * sigma) @ mu
+    w = w / w.sum()          # re-scale to sum to 1 for readability
+    return w
+
+
+with tabs[3]:
+    st.header("Black-Litterman Model — Plain English Edition")
+
+    st.info(
+        "**What problem does this solve?**  \n"
+        "Standard portfolio optimisation (Markowitz) is famously unstable — tiny changes in expected "
+        "return assumptions cause wild swings in portfolio weights. Black-Litterman fixes this by "
+        "anchoring to a sensible starting point: **what the market itself is already pricing in**."
+    )
+
+    with st.expander("Start here — the core idea in plain English", expanded=True):
+        st.markdown(
+            """
+### The two ingredients
+
+**1. The Market's Implied View (the anchor)**
+
+Imagine the entire market as one giant, well-diversified investor.
+All of the buying and selling that happens every day produces *prices* — and those prices imply
+an expected return for every asset.
+
+> Example: if global investors hold 60% stocks / 40% bonds, the market is
+> "saying" that stocks should earn enough extra return to justify that 60% weight.
+
+We call this the **equilibrium return**. It is *not* a prediction — it is simply what the
+current market prices imply, working backwards.
+
+**2. Your Views (the personal tweak)**
+
+You might disagree with the market on one or more assets.
+Maybe you think tech stocks are overvalued, or that emerging market bonds look cheap.
+Black-Litterman lets you express those views as *expected return numbers*, and — crucially —
+lets you say **how confident** you are in each view on a scale of 0 to 100%.
+
+### How they are blended
+
+Think of it like a weighted average:
+
+| Confidence in your view | Result |
+|---|---|
+| 0% | Final return = pure market equilibrium (you ignored your view) |
+| 50% | Halfway blend between market and your view |
+| 100% | Final return = your view (you completely overrode the market) |
+
+The blended number is called the **posterior return** — it feeds into the portfolio
+optimisation to produce the final weights.
+            """
+        )
+
+    st.divider()
+
+    # ── Asset setup ──────────────────────────────────────────────────────────
+    ASSETS = ["Global Stocks", "Government Bonds", "Real Assets"]
+    # Approximate long-run annual volatilities
+    VOLS   = [0.16, 0.07, 0.12]
+    # Approximate pairwise correlations
+    CORR   = np.array([
+        [1.00,  -0.20,  0.30],
+        [-0.20,  1.00, -0.05],
+        [0.30,  -0.05,  1.00],
+    ])
+    SIGMA  = np.outer(VOLS, VOLS) * CORR   # covariance matrix
+    DELTA  = 2.5                            # typical risk aversion coefficient
+
+    st.subheader("Step 1 — Market Starting Point")
+    st.markdown(
+        "Below are the **market cap weights** — roughly how a global passive investor "
+        "is split across three broad asset classes today. These are pre-filled with "
+        "realistic numbers but you can adjust them."
+    )
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        w_stocks = st.slider("Stocks weight (%)", 10, 80, 55, 5,
+                             help="Share of total portfolio in global equities")
+    with col2:
+        w_bonds  = st.slider("Bonds weight (%)",  10, 70, 35, 5,
+                             help="Share of total portfolio in government bonds")
+    with col3:
+        w_real   = st.slider("Real Assets weight (%)", 0, 30, 10, 5,
+                             help="Share in real assets (REITs, commodities, infrastructure)")
+
+    raw_w = np.array([w_stocks, w_bonds, w_real], dtype=float)
+    w_mkt = raw_w / raw_w.sum()
+
+    st.caption(
+        f"Normalised weights: {ASSETS[0]} {w_mkt[0]*100:.1f}% | "
+        f"{ASSETS[1]} {w_mkt[1]*100:.1f}% | {ASSETS[2]} {w_mkt[2]*100:.1f}%  "
+        f"*(weights always sum to 100%)*"
+    )
+
+    # Compute equilibrium returns from market weights
+    pi, _ = bl_posterior(w_mkt, SIGMA, DELTA, [0, 0, 0], [0, 0, 0])
+
+    eq_fig = go.Figure(go.Bar(
+        x=ASSETS,
+        y=pi * 100,
+        marker_color=["#3498db", "#2ecc71", "#e67e22"],
+        text=[f"{v*100:.1f}%" for v in pi],
+        textposition="outside",
+    ))
+    eq_fig.update_layout(
+        title="Market-Implied Equilibrium Returns",
+        yaxis_title="Expected Annual Return (%)",
+        yaxis=dict(ticksuffix="%", range=[0, max(pi * 100) * 1.5]),
+        showlegend=False,
+        height=350,
+    )
+    st.plotly_chart(eq_fig, use_container_width=True)
+
+    st.caption(
+        "These are *not* forecasts. They are the returns the market would need to deliver "
+        "to justify the current price levels and weights — calculated by working backwards "
+        "from prices using a standard risk/return model."
+    )
+
+    st.divider()
+
+    # ── Views ─────────────────────────────────────────────────────────────────
+    st.subheader("Step 2 — Enter Your Views")
+    st.markdown(
+        "For each asset, you can express a **view** (your expected annual return) and a "
+        "**confidence level**. If you have no strong opinion, keep confidence near 0% — "
+        "the model will effectively ignore your input and stick close to the market."
+    )
+
+    views = []
+    confs = []
+    with st.expander("What should I put here?"):
+        st.markdown(
+            """
+- **View return**: your best guess at what this asset class will return over the next year.
+  It does *not* have to be precise. A range in your head is fine — enter the midpoint.
+- **Confidence**: how strongly you believe your view vs. the market.
+  - 10–20% = "slight tilt, I'm not very sure"
+  - 40–60% = "moderate conviction"
+  - 80–100% = "very high conviction" — use sparingly, this overrides the market almost entirely
+            """
+        )
+
+    for i, asset in enumerate(ASSETS):
+        st.markdown(f"**{asset}**")
+        c1, c2 = st.columns(2)
+        eq_pct = pi[i] * 100
+        view_ret = c1.slider(
+            f"Your expected return (%)",
+            -5.0, 20.0, round(eq_pct, 1), 0.5,
+            key=f"view_{i}",
+            help=f"Market equilibrium is {eq_pct:.1f}%. Move above/below to express a bullish/bearish view.",
+        )
+        conf = c2.slider(
+            f"Your confidence in this view (%)",
+            0, 100, 0, 5,
+            key=f"conf_{i}",
+            help="0% = ignore my view, 100% = override the market completely",
+        )
+        views.append(view_ret / 100)
+        confs.append(conf / 100)
+        direction = "above" if view_ret > eq_pct else ("below" if view_ret < eq_pct else "equal to")
+        st.caption(
+            f"Your view ({view_ret:.1f}%) is {direction} the market equilibrium ({eq_pct:.1f}%), "
+            f"with {conf}% confidence."
+        )
+        st.write("")
+
+    st.divider()
+
+    # ── Posterior ─────────────────────────────────────────────────────────────
+    st.subheader("Step 3 — The Blended Result")
+    st.markdown(
+        "The Black-Litterman model now combines the market equilibrium and your views. "
+        "The chart below shows what changes — and by how much."
+    )
+
+    pi_out, mu_bl = bl_posterior(w_mkt, SIGMA, DELTA, views, confs)
+
+    fig_compare = go.Figure()
+    fig_compare.add_trace(go.Bar(
+        name="Market Equilibrium",
+        x=ASSETS,
+        y=pi_out * 100,
+        marker_color="#95a5a6",
+        text=[f"{v*100:.1f}%" for v in pi_out],
+        textposition="outside",
+    ))
+    fig_compare.add_trace(go.Bar(
+        name="BL Posterior (your blend)",
+        x=ASSETS,
+        y=mu_bl * 100,
+        marker_color=["#3498db", "#2ecc71", "#e67e22"],
+        text=[f"{v*100:.1f}%" for v in mu_bl],
+        textposition="outside",
+    ))
+    fig_compare.update_layout(
+        barmode="group",
+        title="Equilibrium vs. Black-Litterman Posterior Returns",
+        yaxis_title="Expected Annual Return (%)",
+        yaxis=dict(ticksuffix="%"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        height=380,
+    )
+    st.plotly_chart(fig_compare, use_container_width=True)
+
+    # Plain-English deltas
+    for i, asset in enumerate(ASSETS):
+        delta_ret = (mu_bl[i] - pi_out[i]) * 100
+        if abs(delta_ret) < 0.05:
+            st.caption(f"**{asset}**: unchanged from market equilibrium ({mu_bl[i]*100:.1f}%)")
+        else:
+            arrow = "up" if delta_ret > 0 else "down"
+            st.caption(
+                f"**{asset}**: nudged {arrow} by {abs(delta_ret):.2f} percentage points "
+                f"→ {mu_bl[i]*100:.1f}% (was {pi_out[i]*100:.1f}%)"
+            )
+
+    st.divider()
+
+    # ── Portfolio weights ──────────────────────────────────────────────────────
+    st.subheader("Step 4 — How Does This Change the Portfolio?")
+    st.markdown(
+        "Higher expected returns attract more allocation. "
+        "The chart below shows how the optimal weights shift once your views are blended in. "
+        "*(Weights are re-scaled to sum to 100% for easy comparison.)*"
+    )
+
+    w_eq = bl_weights(pi_out, SIGMA, DELTA)
+    w_bl = bl_weights(mu_bl, SIGMA, DELTA)
+
+    # Clip negatives for display (explain short-selling is outside scope)
+    w_eq_disp = np.clip(w_eq, 0, None); w_eq_disp /= w_eq_disp.sum()
+    w_bl_disp = np.clip(w_bl, 0, None); w_bl_disp /= w_bl_disp.sum()
+
+    fig_wts = go.Figure()
+    fig_wts.add_trace(go.Bar(
+        name="Market Starting Weights",
+        x=ASSETS,
+        y=w_mkt * 100,
+        marker_color="#95a5a6",
+        text=[f"{v*100:.1f}%" for v in w_mkt],
+        textposition="outside",
+    ))
+    fig_wts.add_trace(go.Bar(
+        name="Optimal Weights (Equilibrium)",
+        x=ASSETS,
+        y=w_eq_disp * 100,
+        marker_color="#bdc3c7",
+        text=[f"{v*100:.1f}%" for v in w_eq_disp],
+        textposition="outside",
+    ))
+    fig_wts.add_trace(go.Bar(
+        name="Optimal Weights (BL — Your Views)",
+        x=ASSETS,
+        y=w_bl_disp * 100,
+        marker_color=["#3498db", "#2ecc71", "#e67e22"],
+        text=[f"{v*100:.1f}%" for v in w_bl_disp],
+        textposition="outside",
+    ))
+    fig_wts.update_layout(
+        barmode="group",
+        title="Portfolio Weights: Market vs. Equilibrium Optimal vs. Your BL Blend",
+        yaxis_title="Weight (%)",
+        yaxis=dict(ticksuffix="%"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        height=400,
+    )
+    st.plotly_chart(fig_wts, use_container_width=True)
+
+    st.divider()
+
+    # ── FAQ / extra context ───────────────────────────────────────────────────
+    with st.expander("Frequently asked questions"):
+        st.markdown(
+            """
+**Q: Why not just use my own expected returns directly?**
+
+You can — but raw mean-variance optimisation is notoriously sensitive.
+A 0.1% change in a single expected return can flip a 10% allocation to 60%.
+BL damps this by pulling everything back toward the market equilibrium, so small
+changes in views produce small, sensible changes in weights.
+
+**Q: What is "risk aversion" (delta)?**
+
+It measures how much extra return an investor demands per unit of risk.
+A delta of ~2.5 is typical for a diversified institutional portfolio.
+Higher delta = more conservative, lower allocation to risky assets.
+
+**Q: What does "tau" mean?**
+
+Tau (τ) controls how much weight to give the equilibrium vs. the views overall.
+A common choice is 0.05 (5%). It is a model-level dial, not an asset-level one.
+In practice, the exact value matters less than the relative confidences you assign.
+
+**Q: Can I have a view on *relative* performance (e.g. stocks will beat bonds)?**
+
+Yes — the full BL model supports relative views (called "tilt views") via the P matrix.
+This simplified version only supports absolute views (one per asset) to keep the
+interface intuitive. Most real implementations support both.
+
+**Q: This doesn't look like the formula I saw in a textbook.**
+
+The formula — μ_BL = [(τΣ)⁻¹ + P'Ω⁻¹P]⁻¹ [(τΣ)⁻¹π + P'Ω⁻¹Q] — is used here exactly,
+with P set to the identity matrix (one absolute view per asset) for clarity.
+            """
+        )
+
+    with st.expander("The one-sentence summary"):
+        st.markdown(
+            "> **Black-Litterman = market common sense + your personal views, "
+            "blended in proportion to how confident you are in each.**"
         )
